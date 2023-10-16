@@ -14,16 +14,19 @@ import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 from torch.utils.data import DataLoader
+from tensorboardX import SummaryWriter
 
 from models.model_retrieval import ALBEF
 from models.vit import interpolate_pos_embed
 from models.tokenization_bert import BertTokenizer
+from dataset.utils import pre_caption
 
 import utils
 from dataset import create_dataset, create_sampler, create_loader
 from scheduler import create_scheduler
 from optim import create_optimizer
-
+# 创建SummaryWriter对象
+writer = SummaryWriter(log_dir='/mnt/workspace/Project/for_test/ALBEF/logs')
 
 def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config):
     # train
@@ -38,15 +41,27 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
     step_size = 100
     warmup_iterations = warmup_steps*step_size  
     
-    for i,(image, text, idx) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for batch_idx, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        image, new_images, texts, new_texts, hard_captions, new_hard, idx, neg_idx = batch
+
         image = image.to(device,non_blocking=True)   
-        idx = idx.to(device,non_blocking=True)   
-        text_input = tokenizer(text, padding='longest', max_length=30, return_tensors="pt").to(device)  
-            
+        new_images = new_images.to(device,non_blocking=True)
+        image = torch.cat([image, new_images])
+        # idx = idx.to(device,non_blocking=True)   
+
+        texts.extend(new_texts)
+        texts.extend(hard_captions)
+        texts.extend(new_hard)
+
+        texts = [pre_caption(texts[i], 30) for i in range(len(texts))]
+        text_input = tokenizer(texts, padding='longest', max_length=30, return_tensors="pt").to(device)  
+
+        idx = torch.cat([idx, neg_idx]).to(device,non_blocking=True)
+
         if epoch>0 or not config['warm_up']:
             alpha = config['alpha']
         else:
-            alpha = config['alpha']*min(1,i/len(data_loader))
+            alpha = config['alpha']*min(1,batch_idx/len(data_loader))
 
         loss_ita, loss_itm = model(image, text_input,alpha=alpha, idx=idx)                  
         loss = loss_ita + loss_itm
@@ -58,8 +73,15 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
         metric_logger.update(loss_itm=loss_itm.item())
         metric_logger.update(loss_ita=loss_ita.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        if epoch==0 and i%step_size==0 and i<=warmup_iterations: 
-            scheduler.step(i//step_size)         
+        if epoch==0 and batch_idx%step_size==0 and batch_idx<=warmup_iterations: 
+            scheduler.step(batch_idx//step_size)     
+
+        # 将学习率和误差写入TensorBoard日志
+        global_step = epoch * len(data_loader) + batch_idx
+        writer.add_scalar('Learning Rate', optimizer.param_groups[0]["lr"], global_step)
+        writer.add_scalar('ITC Loss', loss_ita, global_step) 
+        writer.add_scalar('ITM Loss', loss_itm, global_step) 
+        writer.add_scalar('Loss', loss, global_step)    
         
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -250,7 +272,7 @@ def main(args, config):
                                                           is_trains=[True, False, False], 
                                                           collate_fns=[None,None,None])   
        
-    tokenizer = BertTokenizer.from_pretrained(args.text_encoder)
+    tokenizer = BertTokenizer.from_pretrained('/mnt/workspace/Project/for_test/ALBEF/bert-base-uncase')
 
     #### Model #### 
     print("Creating model")
@@ -355,6 +377,8 @@ def main(args, config):
         with open(os.path.join(args.output_dir, "log.txt"),"a") as f:
             f.write("best epoch: %d"%best_epoch)               
 
+    # 关闭SummaryWriter对象
+    writer.close()
             
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()     

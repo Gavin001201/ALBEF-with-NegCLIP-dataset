@@ -44,7 +44,7 @@ def create_dataset(dataset, config):
     elif dataset=='re':          
         train_dataset = re_train_dataset(config['train_file'], train_transform, config['image_root'])
         val_dataset = re_eval_dataset(config['val_file'], test_transform, config['image_root'])  
-        test_dataset = re_eval_dataset(config['test_file'], test_transform, config['image_root'])                
+        test_dataset = re_eval_dataset(config['test_file'], test_transform, config['image_root'])              
         return train_dataset, val_dataset, test_dataset   
 
     elif dataset=='vqa': 

@@ -23,7 +23,7 @@ class ALBEF(nn.Module):
             mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6))    
 
         bert_config = BertConfig.from_json_file(config['bert_config'])
-        self.text_encoder = BertModel.from_pretrained(text_encoder, config=bert_config, add_pooling_layer=False)      
+        self.text_encoder = BertModel.from_pretrained('/mnt/workspace/Project/for_test/ALBEF/bert-base-uncase', config=bert_config, add_pooling_layer=False)      
 
         text_width = self.text_encoder.config.hidden_size
         self.vision_proj = nn.Linear(vision_width, embed_dim)
@@ -39,7 +39,7 @@ class ALBEF(nn.Module):
             img_size=config['image_res'], patch_size=16, embed_dim=768, depth=12, num_heads=12, 
             mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6)) 
         self.vision_proj_m = nn.Linear(vision_width, embed_dim)
-        self.text_encoder_m = BertModel.from_pretrained(text_encoder, config=bert_config, add_pooling_layer=False)           
+        self.text_encoder_m = BertModel.from_pretrained('/mnt/workspace/Project/for_test/ALBEF/bert-base-uncase', config=bert_config, add_pooling_layer=False)           
         self.text_proj_m = nn.Linear(text_width, embed_dim)   
 
         self.model_pairs = [[self.visual_encoder,self.visual_encoder_m],
@@ -60,15 +60,14 @@ class ALBEF(nn.Module):
         
 
     def forward(self, image, text, alpha, idx):
-        
         image_embeds = self.visual_encoder(image) 
         image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(image.device)
+        image_feat = F.normalize(self.vision_proj(image_embeds[:,0,:]),dim=-1)  # [2*bz,256]
 
-        image_feat = F.normalize(self.vision_proj(image_embeds[:,0,:]),dim=-1) 
         text_output = self.text_encoder(text.input_ids, attention_mask = text.attention_mask,                      
                                         return_dict = True, mode = 'text')            
         text_embeds = text_output.last_hidden_state
-        text_feat = F.normalize(self.text_proj(text_embeds[:,0,:]),dim=-1)                 
+        text_feat = F.normalize(self.text_proj(text_embeds[:,0,:]),dim=-1)      # [4*bz,256]             
 
         idx = idx.view(-1,1)
         idx_all = torch.cat([idx.t(), self.idx_queue.clone().detach()],dim=1)  
@@ -83,17 +82,17 @@ class ALBEF(nn.Module):
             text_output_m = self.text_encoder_m(text.input_ids, attention_mask = text.attention_mask,             
                                                 return_dict = True, mode = 'text')    
             text_feat_m = F.normalize(self.text_proj_m(text_output_m.last_hidden_state[:,0,:]),dim=-1) 
-            text_feat_all = torch.cat([text_feat_m.t(),self.text_queue.clone().detach()],dim=1)
+            text_feat_all = torch.cat([text_feat_m.t(),self.text_queue.clone()[:,image_feat_m.size(0):].detach()],dim=1)
 
             if self.distill:               
                 sim_i2t_m = image_feat_m @ text_feat_all / self.temp 
-                sim_t2i_m = text_feat_m @ image_feat_all / self.temp   
-
+                sim_t2i_m = text_feat_m[:image_feat_m.size(0)] @ image_feat_all / self.temp   
+                # 伪标签 + 独热标签， 伪标签可以纠正独热标签
                 sim_i2t_targets = alpha * F.softmax(sim_i2t_m, dim=1) + (1 - alpha) * sim_targets
                 sim_t2i_targets = alpha * F.softmax(sim_t2i_m, dim=1) + (1 - alpha) * sim_targets 
 
         sim_i2t = image_feat @ text_feat_all / self.temp 
-        sim_t2i = text_feat @ image_feat_all / self.temp           
+        sim_t2i = text_feat[:image_feat_m.size(0)] @ image_feat_all / self.temp           
 
         if self.distill:
             loss_i2t = -torch.sum(F.log_softmax(sim_i2t, dim=1)*sim_i2t_targets,dim=1).mean()
@@ -104,12 +103,12 @@ class ALBEF(nn.Module):
 
         loss_ita = (loss_i2t+loss_t2i)/2
 
-        self._dequeue_and_enqueue(image_feat_m, text_feat_m, idx)
+        # self._dequeue_and_enqueue(image_feat_m, text_feat_m[:image_feat_m.size(0)], idx)
 
         ###=================================###
         # forward the positve image-text pair
-        output_pos = self.text_encoder(encoder_embeds = text_embeds, 
-                                        attention_mask = text.attention_mask,
+        output_pos = self.text_encoder(encoder_embeds = text_embeds[:image_feat_m.size(0)], 
+                                        attention_mask = text.attention_mask[:image_feat_m.size(0)],
                                         encoder_hidden_states = image_embeds,
                                         encoder_attention_mask = image_atts,      
                                         return_dict = True,
@@ -117,11 +116,12 @@ class ALBEF(nn.Module):
                                        )            
         with torch.no_grad():
             bs = image.size(0)      
-            weights_i2t = F.softmax(sim_i2t[:,:bs]+1e-4,dim=1)
+            weights_i2t = F.softmax(sim_i2t[:,:bs*2]+1e-4,dim=1)    # 允许在 4*bz 的所有文本中选择
             weights_t2i = F.softmax(sim_t2i[:,:bs]+1e-4,dim=1)
 
-            mask = torch.eq(idx, idx.T)
-            weights_i2t.masked_fill_(mask, 0)
+            mask = torch.eq(idx, idx.T)         # 对角线为 true
+            # weights_i2t.masked_fill_(mask, 0)   # 对角线为 0
+            weights_i2t[:, :24].masked_fill_(mask, 0)
             weights_t2i.masked_fill_(mask, 0) 
 
         # select a negative image for each text
@@ -136,13 +136,13 @@ class ALBEF(nn.Module):
         text_atts_neg = []
         for b in range(bs):
             neg_idx = torch.multinomial(weights_i2t[b], 1).item()
-            text_embeds_neg.append(text_embeds[neg_idx])
+            text_embeds_neg.append(text_embeds[neg_idx])    # 允许在 4*bz 的所有文本中选择
             text_atts_neg.append(text.attention_mask[neg_idx])
         text_embeds_neg = torch.stack(text_embeds_neg,dim=0)   
         text_atts_neg = torch.stack(text_atts_neg,dim=0)      
 
-        text_embeds_all = torch.cat([text_embeds, text_embeds_neg],dim=0)     
-        text_atts_all = torch.cat([text.attention_mask, text_atts_neg],dim=0)     
+        text_embeds_all = torch.cat([text_embeds[:image_feat_m.size(0)], text_embeds_neg],dim=0)     
+        text_atts_all = torch.cat([text.attention_mask[:image_feat_m.size(0)], text_atts_neg],dim=0)     
 
         image_embeds_all = torch.cat([image_embeds_neg,image_embeds],dim=0)
         image_atts_all = torch.cat([image_atts,image_atts],dim=0)
